@@ -147,27 +147,33 @@ class TeamsDetector:
 
         Returns False (safe default) on any detection failure.
         """
-        pid = self._get_teams_pid()
-        if pid is None:
+        pids = self._get_all_teams_pids()
+        if not pids:
             return False  # Teams not running
 
-        return self._has_coreaudiod_connection(pid)
+        return any(self._has_coreaudiod_connection(pid) for pid in pids)
 
-    def _get_teams_pid(self) -> Optional[int]:
+    def _get_all_teams_pids(self) -> list:
         """
-        Find the PID of the main Teams process using psutil.
+        Find PIDs of ALL Teams-related processes using psutil.
 
-        Returns the first matching PID, or None if Teams is not running.
-        We match process names case-insensitively against TEAMS_PROCESS_NAMES.
+        New Microsoft Teams (v2) routes audio through a child helper process
+        (Microsoft Teams WebView Helper Plugin), not the main MSTeams binary.
+        We must check all of them — any one may hold the coreaudiod connection.
+
+        Returns list of matching PIDs (empty if Teams not running).
         """
+        pids = []
         try:
-            for proc in psutil.process_iter(["pid", "name"]):
+            for proc in psutil.process_iter(["pid", "name", "exe"]):
                 name = (proc.info.get("name") or "").lower()
-                if any(t in name for t in TEAMS_PROCESS_NAMES):
-                    return proc.info["pid"]
+                exe = (proc.info.get("exe") or "").lower()
+                if any(t in name for t in TEAMS_PROCESS_NAMES) or \
+                   any(t in exe for t in TEAMS_PROCESS_NAMES):
+                    pids.append(proc.info["pid"])
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
-        return None
+        return pids
 
     def _has_coreaudiod_connection(self, pid: int) -> bool:
         """

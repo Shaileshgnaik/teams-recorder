@@ -13,9 +13,11 @@ sounddevice>=0.4.6              # Mic + Microsoft Teams Audio virtual device cap
 numpy>=1.24.0                   # Audio array manipulation
 scipy>=1.11.0                   # WAV file I/O (scipy.io.wavfile)
 
-# ── Transcription: Apple built-in Speech Recognition ──────────────────────────
-# No model download needed — uses macOS SFSpeechRecognizer (on-device, offline)
-pyobjc-framework-Speech>=10.0   # SFSpeechRecognizer Python bindings
+# ── Transcription: mlx-whisper (Apple Silicon, no PyTorch required) ───────────
+# Uses Apple's MLX framework — much lighter than openai-whisper (~50 MB install).
+# Model (~145 MB) downloaded once from HuggingFace to ~/.cache/huggingface/
+# No TCC speech recognition permission required.
+mlx-whisper>=0.3.0              # Whisper on Apple MLX framework
 
 # ── Meeting notes: Claude API ─────────────────────────────────────────────────
 anthropic>=0.40.0               # Anthropic Python SDK
