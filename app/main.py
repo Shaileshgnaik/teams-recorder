@@ -23,6 +23,7 @@ from recorder import AudioRecorder
 from transcriber import ParakeetTranscriber
 from note_generator import ClaudeNoteGenerator
 from teams_detector import TeamsDetector
+from overlay import StatusOverlay
 from utils import save_markdown, ensure_notes_dir, NOTES_DIR
 
 ICON_IDLE = "⚪"
@@ -60,6 +61,7 @@ class TeamsRecorderApp(rumps.App):
         self._transcriber = ParakeetTranscriber()
         self._note_gen = ClaudeNoteGenerator()
         self._detector = TeamsDetector()
+        self._overlay = StatusOverlay()
 
         self._recording = False
         self._auto_detect = True
@@ -206,6 +208,7 @@ class TeamsRecorderApp(rumps.App):
         self._status_item.title = f"Status: Recording ({'manual' if manual else 'auto'})..."
         self._start_item.set_callback(None)
         self._stop_item.set_callback(self._on_stop_clicked)
+        self._overlay.show_recording()
 
         try:
             self._recorder.start()
@@ -236,6 +239,7 @@ class TeamsRecorderApp(rumps.App):
         self._status_item.title = "Status: Stopping recording..."
         self._start_item.set_callback(None)
         self._stop_item.set_callback(None)
+        self._overlay.show_processing()
 
         # Capture duration BEFORE stop() — stop() sets _recording=False which
         # makes the duration property return 0.
@@ -311,6 +315,10 @@ class TeamsRecorderApp(rumps.App):
         )
         self._start_item.set_callback(self._on_start_clicked)
         self._stop_item.set_callback(None)
+        if error:
+            self._overlay.show_error(error)
+        else:
+            self._overlay.hide()
 
 
 # --------------------------------------------------------------------------- #
