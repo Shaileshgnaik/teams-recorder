@@ -16,6 +16,8 @@ import time
 import threading
 import numpy as np
 import sounddevice as sd
+from math import gcd
+from scipy.signal import resample_poly
 
 from utils import mix_audio, write_wav, get_wav_tmp_path, SAMPLE_RATE
 
@@ -43,6 +45,8 @@ class AudioRecorder:
         self._start_time: float = 0.0
         self._mic_stream: sd.InputStream | None = None
         self._teams_stream: sd.InputStream | None = None
+        self._mic_native_sr: int = SAMPLE_RATE
+        self._teams_native_sr: int = SAMPLE_RATE
 
     # ---------------------------------------------------------------------- #
     #  Public API
@@ -59,8 +63,10 @@ class AudioRecorder:
         self._start_time = time.time()
 
         # 1. Microphone — always available
+        self._mic_native_sr = self._get_native_sr(None)
         self._start_stream(
             device=None,
+            native_sr=self._mic_native_sr,
             chunks=self._mic_chunks,
             lock=self._mic_lock,
             label="mic",
@@ -69,8 +75,10 @@ class AudioRecorder:
         # 2. Microsoft Teams Audio virtual device — captures full call audio
         teams_idx = self._find_teams_device()
         if teams_idx is not None:
+            self._teams_native_sr = self._get_native_sr(teams_idx)
             self._start_stream(
                 device=teams_idx,
+                native_sr=self._teams_native_sr,
                 chunks=self._teams_chunks,
                 lock=self._teams_lock,
                 label="Teams Audio",
@@ -110,6 +118,10 @@ class AudioRecorder:
             teams_audio = (np.concatenate(self._teams_chunks)
                            if self._teams_chunks else np.zeros(1, dtype=np.float32))
 
+        # Resample both streams to SAMPLE_RATE (16kHz) if captured at a different rate
+        mic_audio = self._resample(mic_audio, self._mic_native_sr)
+        teams_audio = self._resample(teams_audio, self._teams_native_sr)
+
         mixed = mix_audio(mic_audio, teams_audio)
         wav_path = get_wav_tmp_path()
         write_wav(mixed, wav_path)
@@ -131,8 +143,8 @@ class AudioRecorder:
     #  Internal helpers
     # ---------------------------------------------------------------------- #
 
-    def _start_stream(self, device, chunks, lock, label: str) -> None:
-        """Open a sounddevice InputStream for the given device."""
+    def _start_stream(self, device, native_sr: int, chunks, lock, label: str) -> None:
+        """Open a sounddevice InputStream at the device's native sample rate."""
         def callback(indata: np.ndarray, frames: int, time_info, status):
             if status:
                 print(f"[recorder/{label}] {status}")
@@ -143,7 +155,7 @@ class AudioRecorder:
         try:
             stream = sd.InputStream(
                 device=device,
-                samplerate=SAMPLE_RATE,
+                samplerate=native_sr,   # use device's native rate; resample later
                 channels=1,
                 dtype="float32",
                 callback=callback,
@@ -156,10 +168,39 @@ class AudioRecorder:
                 self._teams_stream = stream
 
             dev_name = sd.query_devices(device)["name"] if device is not None else "default mic"
-            print(f"[recorder] Started {label}: {dev_name}")
+            print(f"[recorder] Started {label}: {dev_name} @ {native_sr}Hz")
 
         except Exception as e:
             print(f"[recorder] Could not open {label} stream: {e}")
+
+    @staticmethod
+    def _get_native_sr(device) -> int:
+        """
+        Query a device's native (default) sample rate.
+
+        sounddevice reports this as 'default_samplerate'. We fall back to
+        48000 (the most common rate for virtual audio devices) if not found.
+        """
+        try:
+            info = sd.query_devices(device)
+            return int(info.get("default_samplerate", 48000))
+        except Exception:
+            return 48000
+
+    @staticmethod
+    def _resample(audio: np.ndarray, native_sr: int) -> np.ndarray:
+        """
+        Resample audio from native_sr to SAMPLE_RATE (16kHz) using polyphase filter.
+
+        Uses scipy.signal.resample_poly which is high quality and handles
+        arbitrary rational ratios (e.g., 48000→16000 = 1:3 downsample).
+        """
+        if native_sr == SAMPLE_RATE:
+            return audio  # no resampling needed
+        g = gcd(SAMPLE_RATE, native_sr)
+        up = SAMPLE_RATE // g
+        down = native_sr // g
+        return resample_poly(audio, up, down).astype(np.float32)
 
     @staticmethod
     def _find_teams_device() -> int | None:
