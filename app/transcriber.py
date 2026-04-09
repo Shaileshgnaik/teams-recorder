@@ -37,8 +37,6 @@ class ParakeetTranscriber:
     def __init__(self, model_id: str = DEFAULT_MODEL):
         self.model_id = model_id
         self._model = None   # lazy-loaded on first transcribe() call
-        self._load_fn = None
-        self._transcribe_fn = None
 
     # ---------------------------------------------------------------------- #
     #  Public API
@@ -72,7 +70,7 @@ class ParakeetTranscriber:
         print(f"[transcriber] Transcribing {wav_path} ...")
 
         try:
-            result = self._transcribe_fn(self._model, wav_path)
+            result = self._model.transcribe(wav_path)
             transcript = self._extract_text(result)
             print(f"[transcriber] Done. Transcript length: {len(transcript)} chars")
             return transcript
@@ -87,9 +85,11 @@ class ParakeetTranscriber:
         """
         Load the Parakeet MLX model if not already loaded.
 
-        parakeet-mlx provides:
-          - parakeet_mlx.load_model(model_id) → loads weights from HuggingFace cache
-          - parakeet_mlx.transcribe(model, audio_path) → runs inference
+        parakeet-mlx v0.5+ API:
+          - parakeet_mlx.from_pretrained(model_id) → downloads from HuggingFace Hub
+            and returns a BaseParakeet model instance
+          - model.transcribe(audio_path) → runs inference, returns AlignedResult
+          - AlignedResult.text → full transcript string
 
         The model download happens automatically on first call via HuggingFace Hub
         and is cached in ~/.cache/huggingface/. Subsequent loads use the local cache.
@@ -106,13 +106,12 @@ class ParakeetTranscriber:
                 "(Requires Apple Silicon Mac with MLX support)"
             ) from e
 
-        from parakeet_mlx import load_model, transcribe as _transcribe
+        from parakeet_mlx import from_pretrained
 
         print(f"[transcriber] Loading model: {self.model_id}")
         print("[transcriber] First run will download ~2GB. This may take a few minutes...")
 
-        self._model = load_model(self.model_id)
-        self._transcribe_fn = _transcribe
+        self._model = from_pretrained(self.model_id)
         print("[transcriber] Model loaded successfully.")
 
     @staticmethod
@@ -163,15 +162,15 @@ class ParakeetTranscriber:
         self._ensure_model_loaded()
 
         try:
-            result = self._transcribe_fn(self._model, wav_path)
-            if hasattr(result, "segments") and result.segments:
+            result = self._model.transcribe(wav_path)
+            if hasattr(result, "sentences") and result.sentences:
                 return [
                     {
-                        "start": seg.get("start", 0),
-                        "end": seg.get("end", 0),
-                        "text": seg.get("text", "").strip(),
+                        "start": s.start,
+                        "end": s.end,
+                        "text": s.text.strip(),
                     }
-                    for seg in result.segments
+                    for s in result.sentences
                 ]
         except Exception as e:
             print(f"[transcriber] Segment extraction failed: {e}")

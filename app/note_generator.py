@@ -66,7 +66,7 @@ class ClaudeNoteGenerator:
         # markdown is a complete Markdown document ready to save
     """
 
-    MODEL = "claude-sonnet-4-6"
+    MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
     MAX_TOKENS = 2048
 
     def __init__(self):
@@ -144,7 +144,11 @@ class ClaudeNoteGenerator:
                 "  ANTHROPIC_API_KEY=sk-ant-..."
             )
 
-        self._client = anthropic.Anthropic(api_key=api_key)
+        base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        self._client = anthropic.Anthropic(
+            api_key=api_key,
+            **({"base_url": base_url} if base_url else {}),
+        )
 
     @staticmethod
     def _build_document(notes_body: str, duration_seconds: int) -> str:
