@@ -1,21 +1,23 @@
 """
 teams_detector.py — Monitors for active Microsoft Teams meetings.
 
-Detection strategy for Microsoft Teams v2 (Electron/WebRTC-based):
-1. Is the Teams process running? (psutil)
-2. Is the Microsoft Teams Audio virtual device producing non-silent audio? (sounddevice probe)
+Detection strategy for Microsoft Teams v2 (Electron/WebRTC):
 
-Key insight: Teams v2 uses WebRTC audio which bypasses traditional coreaudiod IPC
-connections (lsof shows nothing). Instead, we probe the "Microsoft Teams Audio"
-virtual device — it carries live call audio when a call is active, and is silent
-when Teams is open but idle.
+1. Teams process is running (psutil).
+2. Any physical audio INPUT device has DeviceIsRunningSomewhere=True via CoreAudio.
+   Teams MUST open the microphone when a call starts. This flips the CoreAudio
+   'DeviceIsRunningSomewhere' flag from False → True for the active mic device.
+   When the call ends and no other app uses the mic, the flag goes back to False.
+
+Virtual devices (Microsoft Teams Audio, ZoomAudioDevice, etc.) are excluded —
+only physical input devices (built-in mic, AirPods, USB headsets) are checked.
 
 When a call starts  → on_join callback fires  → recording begins
 When a call ends    → on_leave callback fires → recording stops + pipeline runs
 """
 
+import ctypes
 import threading
-import numpy as np
 from typing import Callable, Optional
 
 try:
@@ -25,82 +27,131 @@ except ImportError:
     PSUTIL_AVAILABLE = False
     print("[detector] WARNING: psutil not installed. Teams auto-detection disabled.")
 
-try:
-    import sounddevice as sd
-    SOUNDDEVICE_AVAILABLE = True
-except ImportError:
-    SOUNDDEVICE_AVAILABLE = False
-    print("[detector] WARNING: sounddevice not installed. Teams auto-detection disabled.")
+# CoreAudio / CoreFoundation via ctypes
+_ca = ctypes.CDLL('/System/Library/Frameworks/CoreAudio.framework/CoreAudio')
+_cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+_cf.CFStringGetCString.restype  = ctypes.c_bool
+_cf.CFStringGetLength.restype   = ctypes.c_long
+
+# CoreAudio constants
+_SYS_OBJ   = ctypes.c_uint32(1)       # kAudioObjectSystemObject
+_GLOB      = 0x676c6f62               # kAudioObjectPropertyScopeGlobal  ('glob')
+_INPT      = 0x696e7074               # kAudioObjectPropertyScopeInput   ('inpt')
+_EL        = 0
+_DEVLIST   = 0x64657623               # kAudioHardwarePropertyDevices    ('dev#')
+_DEVNAME   = 0x6c6e616d               # kAudioObjectPropertyName         ('lnam')
+_RUNNING   = 0x68737273               # kAudioDevicePropertyDeviceIsRunningSomewhere ('hsrs')
+_INCHAN    = 0x6368616e               # kAudioDevicePropertyStreamConfiguration ('chan') — used to check input channels
+_STREAMS   = 0x73746d23               # kAudioDevicePropertyStreams      ('stm#')
+_UTF8      = 0x08000100
 
 
-# Process name fragments for Microsoft Teams variants (matched case-insensitively)
+class _Addr(ctypes.Structure):
+    _fields_ = [('sel', ctypes.c_uint32), ('scope', ctypes.c_uint32), ('elem', ctypes.c_uint32)]
+
+
+# Virtual device name fragments to EXCLUDE from mic detection
+VIRTUAL_DEVICE_KEYWORDS = (
+    "teams audio", "zoomaudiodevice", "blackhole",
+    "loopback", "soundflower", "virtual",
+)
+
+# Process name fragments for Microsoft Teams
 TEAMS_PROCESS_NAMES = ("teams", "msteams", "ms-teams")
 
-# Keywords to find the Microsoft Teams Audio virtual device
-TEAMS_DEVICE_KEYWORDS = ("microsoft teams audio", "teams audio")
 
-# Audio RMS threshold: above this = call audio present, below = silence/idle
-# Teams virtual device noise floor is effectively 0; any call audio is >> 0.0005
-AUDIO_ACTIVE_THRESHOLD = 0.0005
+def _ca_get_device_ids() -> list:
+    a = _Addr(_DEVLIST, _GLOB, _EL)
+    sz = ctypes.c_uint32(0)
+    _ca.AudioObjectGetPropertyDataSize(_SYS_OBJ, ctypes.byref(a), 0, None, ctypes.byref(sz))
+    count = sz.value // 4
+    buf = (ctypes.c_uint32 * count)()
+    _ca.AudioObjectGetPropertyData(_SYS_OBJ, ctypes.byref(a), 0, None, ctypes.byref(sz), buf)
+    return list(buf)
 
-# Duration (seconds) of audio to sample when probing for call activity
-PROBE_DURATION = 0.3
+
+def _ca_get_name(dev_id: int) -> str:
+    a = _Addr(_DEVNAME, _GLOB, _EL)
+    sz = ctypes.c_uint32(ctypes.sizeof(ctypes.c_void_p))
+    cfstr = ctypes.c_void_p(0)
+    ret = _ca.AudioObjectGetPropertyData(
+        ctypes.c_uint32(dev_id), ctypes.byref(a), 0, None, ctypes.byref(sz), ctypes.byref(cfstr)
+    )
+    if ret != 0 or not cfstr.value:
+        return ''
+    buf = ctypes.create_string_buffer(256)
+    _cf.CFStringGetCString(cfstr, buf, 256, _UTF8)
+    _cf.CFRelease(cfstr)
+    return buf.value.decode('utf-8', errors='ignore')
+
+
+def _ca_has_input_streams(dev_id: int) -> bool:
+    """Return True if this device has at least one input stream (i.e. it's a mic)."""
+    a = _Addr(_STREAMS, _INPT, _EL)
+    sz = ctypes.c_uint32(0)
+    ret = _ca.AudioObjectGetPropertyDataSize(
+        ctypes.c_uint32(dev_id), ctypes.byref(a), 0, None, ctypes.byref(sz)
+    )
+    return ret == 0 and sz.value > 0
+
+
+def _ca_is_running(dev_id: int) -> bool:
+    """Return True if any process currently has an active audio session on this device."""
+    a = _Addr(_RUNNING, _GLOB, _EL)
+    val = ctypes.c_uint32(0)
+    sz  = ctypes.c_uint32(4)
+    ret = _ca.AudioObjectGetPropertyData(
+        ctypes.c_uint32(dev_id), ctypes.byref(a), 0, None, ctypes.byref(sz), ctypes.byref(val)
+    )
+    return ret == 0 and val.value != 0
 
 
 class TeamsDetector:
     """
     Background monitor for Teams meeting activity.
 
-    Detection approach:
-    - Polls every 5 seconds
-    - If Teams is running AND its virtual audio device has non-silent audio → call detected
-    - If audio goes silent after a call → call ended
-
-    Usage:
-        detector = TeamsDetector()
-        detector.start(
-            on_join=lambda: print("Call started"),
-            on_leave=lambda: print("Call ended")
-        )
-        detector.stop()
+    Polls every 5 seconds. Fires on_join when Teams is running and a physical
+    microphone becomes active (Teams opened it for a call). Fires on_leave when
+    the microphone is no longer active.
     """
 
-    POLL_INTERVAL = 5  # seconds between checks
+    POLL_INTERVAL = 5
 
     def __init__(self):
-        self._thread: Optional[threading.Thread] = None
+        self._thread:   Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-        self._in_call = False
-        self._on_join: Optional[Callable] = None
+        self._in_call   = False
+        self._on_join:  Optional[Callable] = None
         self._on_leave: Optional[Callable] = None
-        self._teams_device_index: Optional[int] = None
+        # Physical input device IDs discovered at startup
+        self._input_device_ids: list = []
 
-    # ---------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
     #  Public API
-    # ---------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
 
     def start(self, on_join: Callable, on_leave: Callable) -> None:
-        if not PSUTIL_AVAILABLE or not SOUNDDEVICE_AVAILABLE:
-            print("[detector] Required libraries missing — auto-detection disabled.")
+        if not PSUTIL_AVAILABLE:
+            print("[detector] psutil missing — auto-detection disabled.")
             return
 
-        self._on_join = on_join
+        self._on_join  = on_join
         self._on_leave = on_leave
         self._stop_event.clear()
-        self._in_call = False
-        self._teams_device_index = self._find_teams_device()
+        self._in_call  = False
+        self._input_device_ids = self._find_physical_input_devices()
 
-        if self._teams_device_index is None:
-            print("[detector] Microsoft Teams Audio device not found — "
-                  "auto-detection disabled. Start Teams first.")
+        if self._input_device_ids:
+            names = [_ca_get_name(d) for d in self._input_device_ids]
+            print(f"[detector] Watching mic(s): {', '.join(names)}")
         else:
-            print(f"[detector] Teams Audio device: index {self._teams_device_index}. "
-                  "Polling every 5s.")
+            print("[detector] No physical input devices found — detection may be limited.")
 
         self._thread = threading.Thread(
             target=self._poll_loop, daemon=True, name="TeamsDetector"
         )
         self._thread.start()
+        print("[detector] Teams call detection started (polling every 5s).")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -113,9 +164,9 @@ class TeamsDetector:
     def in_call(self) -> bool:
         return self._in_call
 
-    # ---------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
     #  Polling loop
-    # ---------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
 
     def _poll_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -124,7 +175,7 @@ class TeamsDetector:
 
                 if currently_in_call and not self._in_call:
                     self._in_call = True
-                    print("[detector] Teams call started — triggering auto-record.")
+                    print("[detector] Teams call detected — triggering auto-record.")
                     if self._on_join:
                         self._on_join()
 
@@ -139,83 +190,59 @@ class TeamsDetector:
 
             self._stop_event.wait(timeout=self.POLL_INTERVAL)
 
-    # ---------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
     #  Detection logic
-    # ---------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
 
     def _is_teams_in_call(self) -> bool:
         """
-        Return True only when Teams is actively in a call.
-
-        Two-stage check:
-        1. Teams process is running (psutil).
-        2. Teams Audio virtual device has non-silent audio (sounddevice probe).
+        Return True when:
+          1. A Teams process is running, AND
+          2. At least one physical microphone is active (DeviceIsRunningSomewhere=True).
         """
         if not self._teams_is_running():
             return False
 
-        # Re-discover the device in case Teams restarted
-        if self._teams_device_index is None:
-            self._teams_device_index = self._find_teams_device()
-            if self._teams_device_index is None:
-                return False
+        # Re-discover input devices if list is empty (hot-plug)
+        if not self._input_device_ids:
+            self._input_device_ids = self._find_physical_input_devices()
 
-        return self._teams_audio_is_active()
+        active = [
+            _ca_get_name(d)
+            for d in self._input_device_ids
+            if _ca_is_running(d)
+        ]
+        in_call = len(active) > 0
+        print(f"[detector] Mic check — active: {active or 'none'} → {'IN CALL' if in_call else 'idle'}")
+        return in_call
 
     def _teams_is_running(self) -> bool:
-        """Return True if any Teams process is found."""
         try:
             for proc in psutil.process_iter(["name", "exe"]):
                 name = (proc.info.get("name") or "").lower()
-                exe = (proc.info.get("exe") or "").lower()
+                exe  = (proc.info.get("exe")  or "").lower()
                 if any(t in name for t in TEAMS_PROCESS_NAMES) or \
-                   any(t in exe for t in TEAMS_PROCESS_NAMES):
+                   any(t in exe  for t in TEAMS_PROCESS_NAMES):
                     return True
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
         return False
 
-    def _teams_audio_is_active(self) -> bool:
+    def _find_physical_input_devices(self) -> list:
         """
-        Probe the Teams Audio virtual device for 300ms and check if it's
-        producing non-silent audio. Returns True if RMS > threshold.
-
-        Teams routes all call audio through this virtual device. When idle,
-        the device produces silence (RMS ≈ 0). During a call, audio is present.
+        Return CoreAudio device IDs for physical input devices only.
+        Excludes virtual devices (Teams Audio, ZoomAudioDevice, BlackHole, etc.).
         """
+        results = []
         try:
-            device_info = sd.query_devices(self._teams_device_index)
-            native_sr = int(device_info["default_samplerate"])
-            samples = int(native_sr * PROBE_DURATION)
-
-            audio = sd.rec(
-                samples,
-                samplerate=native_sr,
-                channels=1,
-                device=self._teams_device_index,
-                dtype="float32",
-            )
-            sd.wait()
-
-            rms = float(np.sqrt(np.mean(audio ** 2)))
-            print(f"[detector] Teams Audio RMS: {rms:.6f} "
-                  f"({'active' if rms > AUDIO_ACTIVE_THRESHOLD else 'silent'})")
-            return rms > AUDIO_ACTIVE_THRESHOLD
-
-        except Exception as e:
-            print(f"[detector] Audio probe error: {e}")
-            # Device unavailable — reset so we re-discover next poll
-            self._teams_device_index = None
-            return False
-
-    def _find_teams_device(self) -> Optional[int]:
-        """Find the Microsoft Teams Audio virtual device index."""
-        try:
-            for i, dev in enumerate(sd.query_devices()):
-                name = dev["name"].lower()
-                if any(k in name for k in TEAMS_DEVICE_KEYWORDS):
-                    if dev["max_input_channels"] > 0:
-                        return i
+            for dev_id in _ca_get_device_ids():
+                name = _ca_get_name(dev_id).lower()
+                if not name:
+                    continue
+                if any(v in name for v in VIRTUAL_DEVICE_KEYWORDS):
+                    continue
+                if _ca_has_input_streams(dev_id):
+                    results.append(dev_id)
         except Exception as e:
             print(f"[detector] Device discovery error: {e}")
-        return None
+        return results
