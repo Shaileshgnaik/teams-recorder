@@ -1,20 +1,21 @@
 """
 teams_detector.py — Monitors for active Microsoft Teams meetings.
 
-Detection strategy (accurate — no false positives):
+Detection strategy for Microsoft Teams v2 (Electron/WebRTC-based):
 1. Is the Teams process running? (psutil)
-2. Does Teams have an active connection to coreaudiod? (lsof)
+2. Is the Microsoft Teams Audio virtual device producing non-silent audio? (sounddevice probe)
 
-Key insight: Teams connects to coreaudiod (macOS audio server) ONLY when in a call —
-not when the app is open but idle. Checking `lsof -p <teams_pid>` for a coreaudiod
-connection is a reliable, Teams-specific call indicator.
+Key insight: Teams v2 uses WebRTC audio which bypasses traditional coreaudiod IPC
+connections (lsof shows nothing). Instead, we probe the "Microsoft Teams Audio"
+virtual device — it carries live call audio when a call is active, and is silent
+when Teams is open but idle.
 
 When a call starts  → on_join callback fires  → recording begins
 When a call ends    → on_leave callback fires → recording stops + pipeline runs
 """
 
 import threading
-import subprocess
+import numpy as np
 from typing import Callable, Optional
 
 try:
@@ -24,24 +25,43 @@ except ImportError:
     PSUTIL_AVAILABLE = False
     print("[detector] WARNING: psutil not installed. Teams auto-detection disabled.")
 
+try:
+    import sounddevice as sd
+    SOUNDDEVICE_AVAILABLE = True
+except ImportError:
+    SOUNDDEVICE_AVAILABLE = False
+    print("[detector] WARNING: sounddevice not installed. Teams auto-detection disabled.")
+
 
 # Process name fragments for Microsoft Teams variants (matched case-insensitively)
 TEAMS_PROCESS_NAMES = ("teams", "msteams", "ms-teams")
+
+# Keywords to find the Microsoft Teams Audio virtual device
+TEAMS_DEVICE_KEYWORDS = ("microsoft teams audio", "teams audio")
+
+# Audio RMS threshold: above this = call audio present, below = silence/idle
+# Teams virtual device noise floor is effectively 0; any call audio is >> 0.0005
+AUDIO_ACTIVE_THRESHOLD = 0.0005
+
+# Duration (seconds) of audio to sample when probing for call activity
+PROBE_DURATION = 0.3
 
 
 class TeamsDetector:
     """
     Background monitor for Teams meeting activity.
 
-    Fires callbacks when a Teams call starts or ends.
+    Detection approach:
+    - Polls every 5 seconds
+    - If Teams is running AND its virtual audio device has non-silent audio → call detected
+    - If audio goes silent after a call → call ended
 
     Usage:
         detector = TeamsDetector()
         detector.start(
-            on_join=lambda: print("Call started — recording"),
-            on_leave=lambda: print("Call ended — processing")
+            on_join=lambda: print("Call started"),
+            on_leave=lambda: print("Call ended")
         )
-        # ... app runs forever ...
         detector.stop()
     """
 
@@ -53,37 +73,36 @@ class TeamsDetector:
         self._in_call = False
         self._on_join: Optional[Callable] = None
         self._on_leave: Optional[Callable] = None
+        self._teams_device_index: Optional[int] = None
 
     # ---------------------------------------------------------------------- #
     #  Public API
     # ---------------------------------------------------------------------- #
 
     def start(self, on_join: Callable, on_leave: Callable) -> None:
-        """
-        Start the background polling thread.
-
-        Args:
-            on_join:  Called (no args) when a Teams call is detected starting.
-            on_leave: Called (no args) when a Teams call ends.
-        """
-        if not PSUTIL_AVAILABLE:
-            print("[detector] psutil not available — auto-detection disabled. "
-                  "Use manual Start/Stop from the menu bar.")
+        if not PSUTIL_AVAILABLE or not SOUNDDEVICE_AVAILABLE:
+            print("[detector] Required libraries missing — auto-detection disabled.")
             return
 
         self._on_join = on_join
         self._on_leave = on_leave
         self._stop_event.clear()
         self._in_call = False
+        self._teams_device_index = self._find_teams_device()
+
+        if self._teams_device_index is None:
+            print("[detector] Microsoft Teams Audio device not found — "
+                  "auto-detection disabled. Start Teams first.")
+        else:
+            print(f"[detector] Teams Audio device: index {self._teams_device_index}. "
+                  "Polling every 5s.")
 
         self._thread = threading.Thread(
             target=self._poll_loop, daemon=True, name="TeamsDetector"
         )
         self._thread.start()
-        print("[detector] Teams call detection started (polling every 5s).")
 
     def stop(self) -> None:
-        """Stop the background polling thread."""
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=10)
@@ -92,7 +111,6 @@ class TeamsDetector:
 
     @property
     def in_call(self) -> bool:
-        """True if a Teams call is currently detected as active."""
         return self._in_call
 
     # ---------------------------------------------------------------------- #
@@ -100,12 +118,6 @@ class TeamsDetector:
     # ---------------------------------------------------------------------- #
 
     def _poll_loop(self) -> None:
-        """
-        Main detection loop — runs in background thread.
-
-        State machine:
-            IDLE → (call detected) → IN_CALL → (call ended) → IDLE
-        """
         while not self._stop_event.is_set():
             try:
                 currently_in_call = self._is_teams_in_call()
@@ -136,81 +148,74 @@ class TeamsDetector:
         Return True only when Teams is actively in a call.
 
         Two-stage check:
-        1. Teams process must be running (psutil).
-        2. Teams process must have an open connection to coreaudiod (lsof).
-
-        Why coreaudiod?
-        macOS routes all audio through a central daemon called coreaudiod.
-        Applications connect to it via Mach ports/XPC only when they actively
-        open an audio session — which Teams does exclusively during calls.
-        When Teams is open but idle (no call), it has no coreaudiod connection.
-
-        Returns False (safe default) on any detection failure.
+        1. Teams process is running (psutil).
+        2. Teams Audio virtual device has non-silent audio (sounddevice probe).
         """
-        pids = self._get_all_teams_pids()
-        if not pids:
-            return False  # Teams not running
+        if not self._teams_is_running():
+            return False
 
-        return any(self._has_coreaudiod_connection(pid) for pid in pids)
+        # Re-discover the device in case Teams restarted
+        if self._teams_device_index is None:
+            self._teams_device_index = self._find_teams_device()
+            if self._teams_device_index is None:
+                return False
 
-    def _get_all_teams_pids(self) -> list:
-        """
-        Find PIDs of ALL Teams-related processes using psutil.
+        return self._teams_audio_is_active()
 
-        New Microsoft Teams (v2) routes audio through a child helper process
-        (Microsoft Teams WebView Helper Plugin), not the main MSTeams binary.
-        We must check all of them — any one may hold the coreaudiod connection.
-
-        Returns list of matching PIDs (empty if Teams not running).
-        """
-        pids = []
+    def _teams_is_running(self) -> bool:
+        """Return True if any Teams process is found."""
         try:
-            for proc in psutil.process_iter(["pid", "name", "exe"]):
+            for proc in psutil.process_iter(["name", "exe"]):
                 name = (proc.info.get("name") or "").lower()
                 exe = (proc.info.get("exe") or "").lower()
                 if any(t in name for t in TEAMS_PROCESS_NAMES) or \
                    any(t in exe for t in TEAMS_PROCESS_NAMES):
-                    pids.append(proc.info["pid"])
+                    return True
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
-        return pids
+        return False
 
-    def _has_coreaudiod_connection(self, pid: int) -> bool:
+    def _teams_audio_is_active(self) -> bool:
         """
-        Check if a process has an active connection to coreaudiod.
+        Probe the Teams Audio virtual device for 300ms and check if it's
+        producing non-silent audio. Returns True if RMS > threshold.
 
-        Uses `lsof -p <pid>` which lists all open file descriptors and
-        network/IPC connections for the given process ID. When Teams is in
-        a call, the output includes entries referencing 'coreaudiod'
-        (either as a Unix domain socket path or as a Mach port target name).
-
-        Args:
-            pid: Process ID to inspect.
-
-        Returns:
-            True if coreaudiod connection found, False otherwise (including errors).
+        Teams routes all call audio through this virtual device. When idle,
+        the device produces silence (RMS ≈ 0). During a call, audio is present.
         """
         try:
-            result = subprocess.run(
-                ["lsof", "-p", str(pid)],
-                capture_output=True,
-                text=True,
-                timeout=5,
+            device_info = sd.query_devices(self._teams_device_index)
+            native_sr = int(device_info["default_samplerate"])
+            samples = int(native_sr * PROBE_DURATION)
+
+            audio = sd.rec(
+                samples,
+                samplerate=native_sr,
+                channels=1,
+                device=self._teams_device_index,
+                dtype="float32",
             )
-            output = result.stdout.lower()
+            sd.wait()
 
-            # coreaudiod appears in lsof output as:
-            #   - Unix socket path: /private/tmp/com.apple.audio.coreaudiod/<pid>
-            #   - Service name reference: coreaudiod
-            return "coreaudiod" in output
+            rms = float(np.sqrt(np.mean(audio ** 2)))
+            print(f"[detector] Teams Audio RMS: {rms:.6f} "
+                  f"({'active' if rms > AUDIO_ACTIVE_THRESHOLD else 'silent'})")
+            return rms > AUDIO_ACTIVE_THRESHOLD
 
-        except subprocess.TimeoutExpired:
-            print(f"[detector] lsof timeout for PID {pid} — skipping")
-            return False
-        except FileNotFoundError:
-            # lsof not available (unusual on macOS but handle gracefully)
-            print("[detector] lsof not found — falling back to process-only detection")
-            return True  # fallback: assume in call if Teams running
         except Exception as e:
-            print(f"[detector] lsof error for PID {pid}: {e}")
-            return False  # safe default
+            print(f"[detector] Audio probe error: {e}")
+            # Device unavailable — reset so we re-discover next poll
+            self._teams_device_index = None
+            return False
+
+    def _find_teams_device(self) -> Optional[int]:
+        """Find the Microsoft Teams Audio virtual device index."""
+        try:
+            for i, dev in enumerate(sd.query_devices()):
+                name = dev["name"].lower()
+                if any(k in name for k in TEAMS_DEVICE_KEYWORDS):
+                    if dev["max_input_channels"] > 0:
+                        return i
+        except Exception as e:
+            print(f"[detector] Device discovery error: {e}")
+        return None
