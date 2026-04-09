@@ -3,33 +3,29 @@
 # Install with:
 #   pip install -r requirements.txt
 #
-# Note: parakeet-mlx downloads ~2GB model on first transcription run.
 # All packages require Python 3.11+ on macOS (Apple Silicon recommended).
 
 # ── Menu bar UI ──────────────────────────────────────────────────────────────
 rumps>=0.4.0                    # macOS menu bar app framework (wraps NSStatusItem)
 
 # ── Audio capture ─────────────────────────────────────────────────────────────
-sounddevice>=0.4.6              # Microphone input (wraps PortAudio)
+sounddevice>=0.4.6              # Mic + Microsoft Teams Audio virtual device capture
 numpy>=1.24.0                   # Audio array manipulation
 scipy>=1.11.0                   # WAV file I/O (scipy.io.wavfile)
 
-# ── Transcription: NVIDIA Parakeet on Apple MLX ───────────────────────────────
-parakeet-mlx>=0.1.0             # Parakeet TDT 1.1B, MLX-optimized for Apple Silicon
-mlx>=0.15.0                     # Apple MLX framework (Neural Engine / GPU acceleration)
+# ── Transcription: Apple built-in Speech Recognition ──────────────────────────
+# No model download needed — uses macOS SFSpeechRecognizer (on-device, offline)
+pyobjc-framework-Speech>=10.0   # SFSpeechRecognizer Python bindings
 
 # ── Meeting notes: Claude API ─────────────────────────────────────────────────
-anthropic>=0.40.0               # Anthropic Python SDK (claude-sonnet-4-6)
+anthropic>=0.40.0               # Anthropic Python SDK
 
 # ── Teams process detection ───────────────────────────────────────────────────
 psutil>=5.9.0                   # Cross-platform process utilities
 
-# ── macOS system APIs (ScreenCaptureKit for system audio) ─────────────────────
+# ── macOS system APIs ─────────────────────────────────────────────────────────
 pyobjc-core>=10.0               # Python ↔ Objective-C bridge
 pyobjc-framework-Cocoa>=10.0    # NSObject, AppKit, Foundation
-pyobjc-framework-ScreenCaptureKit>=10.0  # SCStream for system audio capture (no BlackHole needed)
-pyobjc-framework-CoreMedia>=10.0  # CMSampleBuffer for audio buffer conversion
-pyobjc-framework-AVFoundation>=10.0  # AVAudioFormat
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0            # Load ANTHROPIC_API_KEY from .env file

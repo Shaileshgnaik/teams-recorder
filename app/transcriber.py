@@ -1,42 +1,46 @@
 """
-transcriber.py — Transcribes WAV audio files using NVIDIA Parakeet via parakeet-mlx.
+transcriber.py — Transcribes WAV audio using Apple's built-in SFSpeechRecognizer.
 
-parakeet-mlx is the Apple Silicon (MLX framework) port of NVIDIA's Parakeet TDT 1.1B
-speech recognition model. It runs on the Mac's Neural Engine and GPU via Apple's MLX
-framework — no CUDA, no internet needed after the first model download.
+Uses macOS's native Speech Recognition framework (no internet, no model download,
+no HuggingFace). Works completely offline using on-device recognition.
 
-Model: mlx-community/parakeet-tdt-1.1b-v2
-Size: ~2GB (downloaded to ~/.cache/huggingface/ on first run)
-Speed: ~10–20x real-time on M-series chips (60-min meeting → 3–6 min)
+For long meetings (>55 seconds), the audio is automatically split into 55-second
+chunks, each transcribed separately, then concatenated into the full transcript.
 
-Usage:
-    transcriber = ParakeetTranscriber()
-    text = transcriber.transcribe("/tmp/meeting_xxx.wav")
-    print(text)
+Requires "Speech Recognition" permission — macOS prompts the user once automatically
+when the app first calls requestAuthorization.
 """
 
 import os
-from typing import Optional
+import time
+import threading
+import tempfile
+import numpy as np
+import scipy.io.wavfile as wav_io
+
+from utils import SAMPLE_RATE
+
+CHUNK_SECONDS = 55  # just under the ~60s practical limit per SFSpeechURLRecognitionRequest
 
 
-class ParakeetTranscriber:
+class AppleSpeechTranscriber:
     """
-    Wraps parakeet-mlx for speech-to-text transcription.
+    Transcribes audio files using Apple's SFSpeechRecognizer.
 
-    The model is loaded lazily on the first call to transcribe() — this avoids
-    a slow startup when the app launches. Subsequent calls reuse the loaded model
-    (typically instant).
+    Advantages over Parakeet/Whisper for this use case:
+    - No model download (built into macOS)
+    - No internet or HuggingFace access needed
+    - Optimised for Apple Silicon
+    - Handles long audio via automatic chunking
 
-    Attributes:
-        model_id: HuggingFace model ID for Parakeet MLX.
-        _model: Cached model object after first load.
+    Usage:
+        t = AppleSpeechTranscriber()
+        text = t.transcribe("/tmp/meeting_xxx.wav")
     """
 
-    DEFAULT_MODEL = "mlx-community/parakeet-tdt-1.1b-v2"
-
-    def __init__(self, model_id: str = DEFAULT_MODEL):
-        self.model_id = model_id
-        self._model = None   # lazy-loaded on first transcribe() call
+    def __init__(self):
+        self._recognizer = None
+        self._authorized = False
 
     # ---------------------------------------------------------------------- #
     #  Public API
@@ -44,135 +48,192 @@ class ParakeetTranscriber:
 
     def transcribe(self, wav_path: str) -> str:
         """
-        Transcribe a WAV audio file to text using Parakeet MLX.
-
-        The WAV file should be:
-        - Sample rate: 16kHz (Parakeet's expected input)
-        - Channels: mono
-        - Format: 16-bit PCM or float32 (both accepted)
+        Transcribe a WAV file to text.
 
         Args:
-            wav_path: Absolute path to the WAV file to transcribe.
+            wav_path: Path to 16kHz mono WAV file.
 
         Returns:
-            The full transcript as a single string.
-
-        Raises:
-            FileNotFoundError: If wav_path does not exist.
-            ImportError: If parakeet-mlx is not installed.
-            RuntimeError: If transcription fails.
+            Full transcript as a string.
         """
         if not os.path.exists(wav_path):
             raise FileNotFoundError(f"WAV file not found: {wav_path}")
 
-        self._ensure_model_loaded()
+        self._ensure_authorized()
+        self._ensure_recognizer()
 
         print(f"[transcriber] Transcribing {wav_path} ...")
 
-        try:
-            result = self._model.transcribe(wav_path)
-            transcript = self._extract_text(result)
-            print(f"[transcriber] Done. Transcript length: {len(transcript)} chars")
-            return transcript
-        except Exception as e:
-            raise RuntimeError(f"Parakeet transcription failed: {e}") from e
+        # Load audio to determine if chunking is needed
+        sr, audio = wav_io.read(wav_path)
+        if audio.ndim > 1:
+            audio = audio[:, 0]  # take first channel if stereo
+        duration = len(audio) / sr
+
+        if duration <= CHUNK_SECONDS:
+            transcript = self._transcribe_file(wav_path)
+        else:
+            transcript = self._transcribe_chunked(audio, sr, duration)
+
+        print(f"[transcriber] Done. {len(transcript)} chars.")
+        return transcript
 
     # ---------------------------------------------------------------------- #
     #  Internal helpers
     # ---------------------------------------------------------------------- #
 
-    def _ensure_model_loaded(self) -> None:
+    def _ensure_authorized(self) -> None:
         """
-        Load the Parakeet MLX model if not already loaded.
+        Request Speech Recognition authorization if not already granted.
 
-        parakeet-mlx v0.5+ API:
-          - parakeet_mlx.from_pretrained(model_id) → downloads from HuggingFace Hub
-            and returns a BaseParakeet model instance
-          - model.transcribe(audio_path) → runs inference, returns AlignedResult
-          - AlignedResult.text → full transcript string
-
-        The model download happens automatically on first call via HuggingFace Hub
-        and is cached in ~/.cache/huggingface/. Subsequent loads use the local cache.
+        macOS shows a one-time dialog: "Allow <app> to use Speech Recognition?"
+        We block until the user responds (or 30s timeout).
         """
-        if self._model is not None:
-            return  # already loaded
+        if self._authorized:
+            return
 
         try:
-            import parakeet_mlx  # noqa: F401
+            from Speech import SFSpeechRecognizer
         except ImportError as e:
             raise ImportError(
-                "parakeet-mlx is not installed. Install with:\n"
-                "  pip install parakeet-mlx\n"
-                "(Requires Apple Silicon Mac with MLX support)"
+                "pyobjc-framework-Speech not installed.\n"
+                "Run: pip install pyobjc-framework-Speech"
             ) from e
 
-        from parakeet_mlx import from_pretrained
+        status_holder = [None]
+        done = threading.Event()
 
-        print(f"[transcriber] Loading model: {self.model_id}")
-        print("[transcriber] First run will download ~2GB. This may take a few minutes...")
+        def auth_callback(status):
+            status_holder[0] = status
+            done.set()
 
-        self._model = from_pretrained(self.model_id)
-        print("[transcriber] Model loaded successfully.")
+        SFSpeechRecognizer.requestAuthorization_(auth_callback)
+        done.wait(timeout=30)
 
-    @staticmethod
-    def _extract_text(result) -> str:
+        # SFSpeechRecognizerAuthorizationStatus values:
+        # 0 = notDetermined, 1 = denied, 2 = restricted, 3 = authorized
+        status = status_holder[0]
+        if status != 3:
+            status_names = {0: "not determined", 1: "denied", 2: "restricted", 3: "authorized"}
+            raise PermissionError(
+                f"Speech Recognition permission {status_names.get(status, status)}. "
+                "Please allow it in System Settings → Privacy & Security → Speech Recognition."
+            )
+
+        self._authorized = True
+        print("[transcriber] Speech Recognition authorized.")
+
+    def _ensure_recognizer(self) -> None:
+        """Create the SFSpeechRecognizer instance (en-US locale)."""
+        if self._recognizer is not None:
+            return
+
+        from Speech import SFSpeechRecognizer
+        from Foundation import NSLocale
+
+        locale = NSLocale.localeWithLocaleIdentifier_("en-US")
+        self._recognizer = SFSpeechRecognizer.alloc().initWithLocale_(locale)
+
+        if self._recognizer is None or not self._recognizer.isAvailable():
+            raise RuntimeError(
+                "SFSpeechRecognizer not available. "
+                "Check System Settings → Privacy & Security → Speech Recognition."
+            )
+
+    def _transcribe_file(self, wav_path: str) -> str:
         """
-        Extract plain text from the parakeet-mlx transcription result.
+        Transcribe a single audio file using SFSpeechURLRecognitionRequest.
 
-        The result object may be:
-        - A string (some versions return text directly)
-        - An object with a .text attribute
-        - An object with a .segments list of {text: str} dicts
-
-        We handle all three cases defensively.
+        Uses on-device recognition (requiresOnDeviceRecognition=True) so no
+        audio is sent to Apple's servers. Falls back to online if on-device fails.
         """
-        # Case 1: result is already a string
-        if isinstance(result, str):
-            return result.strip()
+        from Speech import SFSpeechURLRecognitionRequest
+        from Foundation import NSURL
 
-        # Case 2: result has a .text attribute
-        if hasattr(result, "text"):
-            return result.text.strip()
+        url = NSURL.fileURLWithPath_(wav_path)
 
-        # Case 3: result has .segments list
-        if hasattr(result, "segments") and result.segments:
-            return " ".join(seg["text"].strip() for seg in result.segments).strip()
+        # Try on-device first (offline, private)
+        for on_device in (True, False):
+            result = self._run_recognition(url, on_device=on_device)
+            if result is not None:
+                return result
+            if on_device:
+                print("[transcriber] On-device recognition failed, trying online...")
 
-        # Case 4: result is a list of segment dicts
-        if isinstance(result, list):
-            return " ".join(
-                (seg.get("text", "") or seg.get("transcript", "")).strip()
-                for seg in result
-            ).strip()
+        return ""
 
-        # Fallback
-        return str(result).strip()
-
-    def get_segments(self, wav_path: str) -> list[dict]:
+    def _run_recognition(self, url, on_device: bool) -> str | None:
         """
-        Transcribe and return word/segment-level timestamps.
+        Run a single SFSpeechURLRecognitionRequest and wait for the result.
+
+        Returns the transcript string, or None if recognition failed.
+        """
+        from Speech import SFSpeechURLRecognitionRequest
+
+        request = SFSpeechURLRecognitionRequest.alloc().initWithURL_(url)
+        request.setShouldReportPartialResults_(False)
+        request.setRequiresOnDeviceRecognition_(on_device)
+
+        result_text = [None]
+        error_holder = [None]
+        done = threading.Event()
+
+        def handler(result, error):
+            if error:
+                error_holder[0] = str(error)
+                done.set()
+                return
+            if result and result.isFinal():
+                result_text[0] = result.bestTranscription().formattedString()
+                done.set()
+
+        self._recognizer.recognitionTaskWithRequest_resultHandler_(request, handler)
+        done.wait(timeout=300)  # up to 5 minutes per chunk
+
+        if error_holder[0]:
+            print(f"[transcriber] Recognition error: {error_holder[0]}")
+            return None
+
+        return result_text[0] or ""
+
+    def _transcribe_chunked(self, audio: np.ndarray, sr: int, duration: float) -> str:
+        """
+        Split long audio into CHUNK_SECONDS chunks and transcribe each one.
+
+        Args:
+            audio: Raw audio samples as numpy array.
+            sr: Sample rate of the audio.
+            duration: Total duration in seconds.
 
         Returns:
-            List of dicts: [{"start": float, "end": float, "text": str}, ...]
-            Returns empty list if segments not supported by this model version.
+            Concatenated transcript of all chunks.
         """
-        if not os.path.exists(wav_path):
-            raise FileNotFoundError(f"WAV file not found: {wav_path}")
+        chunk_samples = int(CHUNK_SECONDS * sr)
+        total_chunks = int(np.ceil(len(audio) / chunk_samples))
+        print(f"[transcriber] Long audio ({duration:.0f}s) — splitting into {total_chunks} chunks.")
 
-        self._ensure_model_loaded()
+        transcripts = []
+        for i in range(0, len(audio), chunk_samples):
+            chunk_num = i // chunk_samples + 1
+            chunk = audio[i: i + chunk_samples]
+            print(f"[transcriber] Chunk {chunk_num}/{total_chunks}...")
 
-        try:
-            result = self._model.transcribe(wav_path)
-            if hasattr(result, "sentences") and result.sentences:
-                return [
-                    {
-                        "start": s.start,
-                        "end": s.end,
-                        "text": s.text.strip(),
-                    }
-                    for s in result.sentences
-                ]
-        except Exception as e:
-            print(f"[transcriber] Segment extraction failed: {e}")
+            # Write chunk to temp WAV
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                chunk_path = f.name
+            try:
+                wav_io.write(chunk_path, sr, chunk)
+                text = self._transcribe_file(chunk_path)
+                if text:
+                    transcripts.append(text.strip())
+            finally:
+                try:
+                    os.unlink(chunk_path)
+                except OSError:
+                    pass
 
-        return []
+        return " ".join(transcripts)
+
+
+# Keep class name consistent with what main.py expects
+ParakeetTranscriber = AppleSpeechTranscriber
