@@ -210,6 +210,12 @@ class TeamsRecorderApp(rumps.App):
         try:
             self._recorder.start()
             print(f"[app] Recording started ({'manual' if manual else 'auto'}).")
+            if not manual:
+                rumps.notification(
+                    title="Teams Recorder",
+                    subtitle="Recording started automatically",
+                    message="Teams call detected. Recording in progress.",
+                )
         except Exception as e:
             self._recording = False
             self._reset_ui(error=str(e))
