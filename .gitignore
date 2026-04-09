@@ -1,0 +1,27 @@
+# Secrets and environment
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Temp audio files
+/tmp/meeting_*.wav
+
+# Model cache (large, re-downloaded automatically)
+.cache/
+
+# IDE
+.vscode/
+.idea/
