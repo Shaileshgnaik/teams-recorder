@@ -12,10 +12,11 @@ import ctypes
 import subprocess
 import os
 import psutil
+from ctypes.util import find_library
 
 # ── CoreAudio setup ────────────────────────────────────────────────────────────
-_ca = ctypes.CDLL('/System/Library/Frameworks/CoreAudio.framework/CoreAudio')
-_cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+_ca = ctypes.CDLL(find_library("CoreAudio"))
+_cf = ctypes.CDLL(find_library("CoreFoundation"))
 _cf.CFStringGetCString.restype = ctypes.c_bool
 
 _SYS_OBJ  = ctypes.c_uint32(1)

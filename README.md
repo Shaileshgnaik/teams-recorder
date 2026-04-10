@@ -138,6 +138,237 @@ flowchart TD
 
 ---
 
+## Installing on a New Mac — Step-by-Step
+
+This guide works for **any Apple Silicon Mac** (M1 / M2 / M3 / M4) running macOS 14 or later. Follow every step in order.
+
+---
+
+### Step 1 — Verify your Mac is compatible
+
+Open Terminal and run:
+
+```bash
+uname -m          # must print: arm64
+sw_vers           # must show macOS 14.0 or later
+```
+
+If `uname -m` prints `x86_64` (Intel Mac), this app will not work — mlx-whisper requires Apple Silicon.
+
+---
+
+### Step 2 — Install Homebrew (if not already installed)
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+Follow the prompts. After install, run the `eval` command it shows to add `brew` to your PATH.
+
+---
+
+### Step 3 — Install Python 3.12
+
+```bash
+brew install python@3.12
+python3.12 --version   # should print: Python 3.12.x
+```
+
+---
+
+### Step 4 — Install Xcode Command Line Tools
+
+Required by PyObjC (the Python–macOS bridge):
+
+```bash
+xcode-select --install
+```
+
+A dialog will appear. Click **Install**. Wait for it to complete (~5 minutes).
+
+---
+
+### Step 5 — Install Microsoft Teams
+
+Download and install **Microsoft Teams** from [microsoft.com/en-us/microsoft-teams/download-app](https://www.microsoft.com/en-us/microsoft-teams/download-app) (or the Mac App Store).
+
+Launch Teams and sign in **before** continuing.
+
+---
+
+### Step 6 — Clone the repository
+
+```bash
+git clone https://github.com/Shaileshgnaik/teams-recorder.git
+cd teams-recorder
+```
+
+---
+
+### Step 7 — Run the setup script
+
+```bash
+chmod +x setup.sh && ./setup.sh
+```
+
+This creates a virtual environment, installs all Python packages, and creates `~/Documents/MeetingNotes/`.
+
+Expected output ends with:
+```
+=== Setup complete! ===
+```
+
+If you see errors about PortAudio, run:
+```bash
+brew install portaudio
+./setup.sh   # re-run
+```
+
+---
+
+### Step 8 — Configure your API key
+
+```bash
+# Open the .env file in any text editor, e.g.:
+open -e .env
+```
+
+Replace `sk-ant-your-key-here` with your actual Anthropic API key:
+
+```
+ANTHROPIC_API_KEY=sk-ant-api03-...
+```
+
+Get a key at [console.anthropic.com](https://console.anthropic.com/) → API Keys → Create Key.
+
+> **Corporate / SAP users:** Also add:
+> ```
+> ANTHROPIC_BASE_URL=http://localhost:6655/anthropic/
+> ```
+
+---
+
+### Step 9 — Calibrate call detection for your Mac ⚠️
+
+> **This step is required.** The detection thresholds are tuned for a specific machine. Skipping this means calls may not be detected (or detected when idle).
+
+**9a. Measure idle state** — with Teams open but NOT in a call:
+
+```bash
+source venv/bin/activate
+python app/diagnose_call.py
+```
+
+In the output, find the `MSTeams` row under `── Teams Process Info ──`:
+```
+{'num_threads': 65, 'num_fds': 72, 'name': 'MSTeams', ...}
+```
+
+Note down: **idle threads = 65, idle FDs = 72**
+
+**9b. Measure in-call state** — join any Teams call, then immediately run:
+
+```bash
+python app/diagnose_call.py
+```
+
+Note down the new `MSTeams` values, e.g.: **call threads = 80, call FDs = 86**
+
+**9c. Calculate thresholds**
+
+```
+thread_delta = call_threads - idle_threads   →  80 - 65 = 15
+fd_delta     = call_fds     - idle_fds       →  86 - 72 = 14
+
+Set thresholds to roughly half the delta:
+TEAMS_THREAD_DELTA = 7     (half of 15, rounded down)
+TEAMS_FD_DELTA     = 7     (half of 14, rounded down)
+```
+
+**9d. Add to `.env`:**
+
+```bash
+# open .env again and add:
+TEAMS_THREAD_DELTA=7
+TEAMS_FD_DELTA=7
+```
+
+> **Rule of thumb:** set threshold to half the observed delta. This gives a buffer — the signal still triggers cleanly during a call but doesn't fire when idle.
+
+---
+
+### Step 10 — Grant Microphone permission
+
+Start the app once:
+
+```bash
+source venv/bin/activate
+python app/main.py
+```
+
+On first recording, macOS will prompt:
+
+> *"Python" would like to access the microphone*
+
+Click **Allow**. If the prompt doesn't appear, go to:
+**System Settings → Privacy & Security → Microphone** and enable Python.
+
+---
+
+### Step 11 — Test the full pipeline
+
+1. Make sure Teams is running
+2. In the terminal with the app running, watch for:
+   ```
+   [detector] MSTeams baseline: threads=XX, fds=XX
+   [detector] Teams call detection started (polling every 5s).
+   ```
+3. Join a Teams call
+4. Within 5 seconds you should see:
+   ```
+   [detector] Primary signal fired → IN CALL
+   [detector] Teams call detected — triggering auto-record.
+   [recorder] Recording started.
+   ```
+5. Leave the call
+6. The pipeline should complete:
+   ```
+   [transcriber] Transcribing XX.Xs of audio...
+   [notes] Generating meeting notes via Claude ...
+   [app] Notes saved: ~/Documents/MeetingNotes/YYYY-MM-DD_HH-MM_meeting.md
+   ```
+
+---
+
+### Quick Reference — What each step installs
+
+| Step | What | Why |
+|------|------|-----|
+| Homebrew | Package manager | Installs Python, PortAudio |
+| Python 3.12 | Runtime | The app requires 3.11+ |
+| Xcode CLI Tools | C compiler + headers | PyObjC needs them to build |
+| Microsoft Teams | Target app | Required for call detection and Teams Audio device |
+| `pip install -r requirements.txt` | All Python packages | See table below |
+| API key | Anthropic credential | Claude note generation |
+| Calibration | Machine-specific thresholds | Call detection accuracy |
+
+### Python packages installed by `setup.sh`
+
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `rumps` | ≥0.4.0 | macOS menu bar app framework |
+| `sounddevice` | ≥0.4.6 | Audio capture (wraps PortAudio) |
+| `numpy` | ≥1.24 | Audio array operations |
+| `scipy` | ≥1.11 | WAV I/O + audio resampling |
+| `mlx-whisper` | ≥0.3.0 | On-device speech-to-text (Apple MLX) |
+| `anthropic` | ≥0.40 | Claude API client |
+| `psutil` | ≥5.9 | Process monitoring (call detection) |
+| `pyobjc-core` | ≥10.0 | Python ↔ macOS Objective-C bridge |
+| `pyobjc-framework-Cocoa` | ≥10.0 | AppKit, Foundation (overlay window) |
+| `python-dotenv` | ≥1.0 | Load `.env` config file |
+
+---
+
 ## Prerequisites
 
 ### Hardware

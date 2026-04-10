@@ -7,13 +7,17 @@ macOS Sonoma intentionally blocks kAudioDevicePropertyDeviceIsRunningSomewhere
 (returns error -1) and IOAudioEngine state queries as a privacy protection.
 All CoreAudio/IOKit-based mic-usage detection is unavailable to unprivileged apps.
 
-Instead, we monitor the MSTeams process resource usage. Diagnostics show that
-when a Teams call is active the main MSTeams process consistently gains:
-  • +3 threads  (65 idle → 68 in-call)
-  • +6 file descriptors  (73 idle → 79 in-call)
+Instead, we monitor the MSTeams process resource usage. When a call starts,
+MSTeams consistently gains extra threads and file descriptors. We capture a
+baseline snapshot the first time MSTeams is seen, then declare a call when
+both thread count and FD count exceed their baselines by set thresholds.
 
-We capture a baseline snapshot the first time MSTeams is seen, then declare a
-call when both thread count and FD count exceed their baselines by set thresholds.
+Thresholds are configurable via environment variables so they can be tuned
+per machine without touching source code:
+    TEAMS_THREAD_DELTA=2   (default: 2)
+    TEAMS_FD_DELTA=4       (default: 4)
+
+Run app/diagnose_call.py idle and in-call to find the right values for your Mac.
 
 Secondary signal: new CoreAudio input device appeared (catches AirPods switching
 from A2DP → HFP mode when Teams activates them for a call).
@@ -22,8 +26,10 @@ When a call starts  → on_join callback fires  → recording begins
 When a call ends    → on_leave callback fires → recording stops + pipeline runs
 """
 
+import os
 import ctypes
 import threading
+from ctypes.util import find_library
 from typing import Callable, Optional
 
 try:
@@ -33,9 +39,14 @@ except ImportError:
     PSUTIL_AVAILABLE = False
     print("[detector] WARNING: psutil not installed. Teams auto-detection disabled.")
 
-# CoreAudio / CoreFoundation via ctypes (used for secondary AirPods signal)
-_ca = ctypes.CDLL('/System/Library/Frameworks/CoreAudio.framework/CoreAudio')
-_cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+# CoreAudio / CoreFoundation via ctypes (used for secondary AirPods signal).
+# Use find_library() so the path resolves correctly on any macOS version.
+_ca_path = find_library("CoreAudio")
+_cf_path = find_library("CoreFoundation")
+if not _ca_path or not _cf_path:
+    raise RuntimeError("CoreAudio or CoreFoundation framework not found. macOS required.")
+_ca = ctypes.CDLL(_ca_path)
+_cf = ctypes.CDLL(_cf_path)
 _cf.CFStringGetCString.restype = ctypes.c_bool
 
 _SYS_OBJ = ctypes.c_uint32(1)
@@ -48,9 +59,12 @@ _STREAMS = 0x73746d23
 _UTF8    = 0x08000100
 
 # How many extra threads / FDs above baseline indicate an active call.
-# Based on observed deltas: +3 threads, +6 FDs. Use half as threshold for safety.
-THREAD_DELTA_THRESHOLD = 2
-FD_DELTA_THRESHOLD     = 4
+# Defaults based on observed deltas on Apple M3 / macOS 26.3 (+3 threads, +6 FDs).
+# Override via environment variables if detection is unreliable on your machine:
+#   export TEAMS_THREAD_DELTA=3
+#   export TEAMS_FD_DELTA=5
+THREAD_DELTA_THRESHOLD = int(os.environ.get("TEAMS_THREAD_DELTA", "2"))
+FD_DELTA_THRESHOLD     = int(os.environ.get("TEAMS_FD_DELTA",     "4"))
 
 VIRTUAL_DEVICE_KEYWORDS = (
     "teams audio", "zoomaudiodevice", "blackhole",
