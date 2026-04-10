@@ -9,8 +9,11 @@ on first use. No TCC speech recognition permissions required.
 """
 
 import os
+import numpy as np
+import scipy.io.wavfile as wav_io
 
 MLX_MODEL = os.environ.get("WHISPER_MODEL", "mlx-community/whisper-base.en-mlx")
+WHISPER_SR = 16000  # Whisper always expects 16 kHz
 
 
 class WhisperTranscriber:
@@ -55,18 +58,45 @@ class WhisperTranscriber:
 
         if not self._loaded:
             print(f"[transcriber] Loading mlx-whisper model '{MLX_MODEL}'...")
-            print("[transcriber] (First run downloads ~145 MB to ~/.cache/huggingface/)")
             self._loaded = True
 
-        print(f"[transcriber] Transcribing {wav_path}...")
+        # Load WAV via scipy — avoids ffmpeg dependency entirely
+        sr, audio = wav_io.read(wav_path)
+        audio = self._to_float32_mono(audio, sr)
+
+        print(f"[transcriber] Transcribing {len(audio)/WHISPER_SR:.1f}s of audio...")
         result = mlx_whisper.transcribe(
-            wav_path,
+            audio,
             path_or_hf_repo=MLX_MODEL,
             verbose=False,
         )
         text = result.get("text", "").strip()
         print(f"[transcriber] Done. {len(text)} chars.")
         return text
+
+    # ---------------------------------------------------------------------- #
+    #  Internal helpers
+    # ---------------------------------------------------------------------- #
+
+    def _to_float32_mono(self, audio: np.ndarray, sr: int) -> np.ndarray:
+        """Convert WAV data to float32 mono at 16 kHz (Whisper's required format)."""
+        # Stereo → mono
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        # Integer PCM → float32 in [-1, 1]
+        if audio.dtype == np.int16:
+            audio = audio.astype(np.float32) / 32768.0
+        elif audio.dtype == np.int32:
+            audio = audio.astype(np.float32) / 2147483648.0
+        else:
+            audio = audio.astype(np.float32)
+        # Resample to 16 kHz if needed
+        if sr != WHISPER_SR:
+            from scipy.signal import resample_poly
+            import math
+            gcd = math.gcd(WHISPER_SR, sr)
+            audio = resample_poly(audio, WHISPER_SR // gcd, sr // gcd).astype(np.float32)
+        return audio
 
 
 # Keep alias so main.py import doesn't need to change
