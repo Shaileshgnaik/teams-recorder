@@ -241,9 +241,9 @@ ANTHROPIC_API_KEY=sk-ant-api03-...
 
 Get a key at [console.anthropic.com](https://console.anthropic.com/) → API Keys → Create Key.
 
-> **Corporate / SAP users:** Also add:
+> **Corporate / proxy users:** If your organisation routes API traffic through an internal gateway, also add:
 > ```
-> ANTHROPIC_BASE_URL=http://localhost:6655/anthropic/
+> ANTHROPIC_BASE_URL=http://your-proxy-host/anthropic/
 > ```
 
 ---
@@ -433,8 +433,8 @@ Edit `.env`:
 # Standard Anthropic key
 ANTHROPIC_API_KEY=sk-ant-your-key-here
 
-# Corporate proxy (optional — e.g. SAP AI Core or similar)
-# ANTHROPIC_BASE_URL=http://localhost:6655/anthropic/
+# Corporate proxy (optional — for organisations routing API traffic through an internal gateway)
+# ANTHROPIC_BASE_URL=http://your-proxy-host/anthropic/
 ```
 
 ### 4. Run the app
@@ -741,4 +741,4 @@ FD_DELTA_THRESHOLD     = 4   # minimum FD increase above baseline
 | **Electron / WebView2** | Microsoft Teams v2 is built on Electron (a framework for building desktop apps using web technologies — HTML, CSS, JavaScript). It embeds a Chromium-based WebView2 for rendering. Teams' audio capture uses WebRTC inside this embedded browser engine. |
 | **WebRTC** | "Web Real-Time Communication" — a browser standard for real-time audio/video calls. Teams uses it internally for call audio. WebRTC in Electron bypasses some traditional CoreAudio monitoring paths, which is partly why `DeviceIsRunningSomewhere` doesn't detect it. |
 | **scipy.signal.resample_poly** | A high-quality audio resampling function using polyphase filtering. "Poly" = multiple phases, allowing exact rational ratio resampling (e.g., 48000 → 16000 Hz = exactly 1:3 ratio) with minimal distortion. |
-| **Corporate Proxy / `ANTHROPIC_BASE_URL`** | Some organisations route all external API traffic through an internal proxy server (e.g., SAP AI Core). Setting `ANTHROPIC_BASE_URL` points the Anthropic SDK to that proxy instead of directly to `api.anthropic.com`. The SDK is otherwise identical. |
+| **Corporate Proxy / `ANTHROPIC_BASE_URL`** | Some organisations route all external API traffic through an internal proxy server or AI gateway. Setting `ANTHROPIC_BASE_URL` points the Anthropic SDK to that proxy instead of directly to `api.anthropic.com`. The SDK is otherwise identical. |
